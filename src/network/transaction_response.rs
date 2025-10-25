@@ -130,7 +130,7 @@ mod serde_from {
     use crate::network::tx_envelope::TxEnvelope;
     use crate::network::unsigned_tx::eip712::TxEip712;
     use alloy::consensus::{Signed, transaction::Recovered};
-    use alloy::primitives::BlockHash;
+    use alloy::primitives::{BlockHash, Signature, U256};
     use serde::{Deserialize, Serialize};
 
     /// Exactly the same thing as [`alloy::rpc::types::transaction::Transaction`] but without the
@@ -152,12 +152,31 @@ mod serde_from {
         pub effective_gas_price: Option<String>,
     }
 
+    /// Same as TransactionWithoutFrom but without signature fields, since some nodes
+    /// omit them in full tx objects. We'll synthesize a dummy signature during conversion.
+    #[derive(Serialize, Deserialize)]
+    pub struct TransactionWithoutFromUnsigned {
+        #[serde(flatten)]
+        pub inner: TxEip712,
+        #[serde(default, rename = "blockHash")]
+        pub block_hash: Option<BlockHash>,
+        #[serde(default, rename = "blockNumber")]
+        pub block_number: Option<String>,
+        #[serde(default, rename = "transactionIndex")]
+        pub transaction_index: Option<String>,
+        #[serde(default, rename = "effectiveGasPrice")]
+        pub effective_gas_price: Option<String>,
+    }
+
     /// (De)serializes both regular [`alloy::rpc::types::transaction::Transaction`] and [`TransactionWithoutFrom`].
     #[derive(Serialize, Deserialize)]
     #[serde(untagged)]
     pub enum TransactionEither {
         Regular(alloy::rpc::types::transaction::Transaction<TxEnvelope>),
         WithoutFrom(TransactionWithoutFrom),
+        // Some zkSync nodes omit signature fields in full tx objects for type 0x71.
+        // Accept an unsigned EIP-712 tx and synthesize a zero signature.
+        WithoutFromUnsigned(TransactionWithoutFromUnsigned),
     }
 
     impl From<TransactionEither> for TransactionResponse {
@@ -185,6 +204,22 @@ mod serde_from {
                     TransactionResponse {
                         inner: alloy::rpc::types::transaction::Transaction {
                             inner: Recovered::new_unchecked(TxEnvelope::Eip712(value.inner), from),
+                            block_hash: value.block_hash,
+                            block_number: parse_u64_opt_hex(&value.block_number),
+                            transaction_index: parse_u64_opt_hex(&value.transaction_index),
+                            effective_gas_price: parse_u128_opt_hex(&value.effective_gas_price),
+                        },
+                    }
+                }
+                TransactionEither::WithoutFromUnsigned(value) => {
+                    use alloy::primitives::Signature;
+                    let from = value.inner.from;
+                    // Synthesize a zero signature; hash will be computed lazily if needed.
+                    let dummy_sig = Signature::new(U256::ZERO, U256::ZERO, false);
+                    let signed = Signed::new_unhashed(value.inner, dummy_sig);
+                    TransactionResponse {
+                        inner: alloy::rpc::types::transaction::Transaction {
+                            inner: Recovered::new_unchecked(TxEnvelope::Eip712(signed), from),
                             block_hash: value.block_hash,
                             block_number: parse_u64_opt_hex(&value.block_number),
                             transaction_index: parse_u64_opt_hex(&value.transaction_index),
