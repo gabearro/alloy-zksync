@@ -140,10 +140,16 @@ mod serde_from {
     pub struct TransactionWithoutFrom {
         #[serde(flatten)]
         pub inner: Signed<TxEip712>,
+        #[serde(default, rename = "blockHash")]
         pub block_hash: Option<BlockHash>,
-        pub block_number: Option<u64>,
-        pub transaction_index: Option<u64>,
-        pub effective_gas_price: Option<u128>,
+        // JSON-RPC uses 0x-prefixed hex strings for numeric fields. We deserialize into String
+        // here and parse manually to avoid relying on alloy's private serde helpers.
+        #[serde(default, rename = "blockNumber")]
+        pub block_number: Option<String>,
+        #[serde(default, rename = "transactionIndex")]
+        pub transaction_index: Option<String>,
+        #[serde(default, rename = "effectiveGasPrice")]
+        pub effective_gas_price: Option<String>,
     }
 
     /// (De)serializes both regular [`alloy::rpc::types::transaction::Transaction`] and [`TransactionWithoutFrom`].
@@ -156,6 +162,22 @@ mod serde_from {
 
     impl From<TransactionEither> for TransactionResponse {
         fn from(value: TransactionEither) -> Self {
+            fn parse_u64_opt_hex(s: &Option<String>) -> Option<u64> {
+                s.as_ref().and_then(|v| {
+                    let v = v.trim();
+                    if v.is_empty() { return None; }
+                    let v = v.strip_prefix("0x").unwrap_or(v);
+                    u64::from_str_radix(v, 16).ok()
+                })
+            }
+            fn parse_u128_opt_hex(s: &Option<String>) -> Option<u128> {
+                s.as_ref().and_then(|v| {
+                    let v = v.trim();
+                    if v.is_empty() { return None; }
+                    let v = v.strip_prefix("0x").unwrap_or(v);
+                    u128::from_str_radix(v, 16).ok()
+                })
+            }
             match value {
                 TransactionEither::Regular(tx) => TransactionResponse { inner: tx },
                 TransactionEither::WithoutFrom(value) => {
@@ -164,9 +186,9 @@ mod serde_from {
                         inner: alloy::rpc::types::transaction::Transaction {
                             inner: Recovered::new_unchecked(TxEnvelope::Eip712(value.inner), from),
                             block_hash: value.block_hash,
-                            block_number: value.block_number,
-                            transaction_index: value.transaction_index,
-                            effective_gas_price: value.effective_gas_price,
+                            block_number: parse_u64_opt_hex(&value.block_number),
+                            transaction_index: parse_u64_opt_hex(&value.transaction_index),
+                            effective_gas_price: parse_u128_opt_hex(&value.effective_gas_price),
                         },
                     }
                 }
@@ -176,15 +198,21 @@ mod serde_from {
 
     impl From<TransactionResponse> for TransactionEither {
         fn from(value: TransactionResponse) -> Self {
+            fn to_hex_opt_u64(v: &Option<u64>) -> Option<String> {
+                v.map(|x| format!("0x{:x}", x))
+            }
+            fn to_hex_opt_u128(v: &Option<u128>) -> Option<String> {
+                v.map(|x| format!("0x{:x}", x))
+            }
             match value.inner.inner.as_ref() {
                 TxEnvelope::Native(_) => TransactionEither::Regular(value.inner),
                 TxEnvelope::Eip712(signed) => {
                     TransactionEither::WithoutFrom(TransactionWithoutFrom {
                         inner: signed.clone(),
                         block_hash: value.inner.block_hash,
-                        block_number: value.inner.block_number,
-                        transaction_index: value.inner.transaction_index,
-                        effective_gas_price: value.inner.effective_gas_price,
+                        block_number: to_hex_opt_u64(&value.inner.block_number),
+                        transaction_index: to_hex_opt_u64(&value.inner.transaction_index),
+                        effective_gas_price: to_hex_opt_u128(&value.inner.effective_gas_price),
                     })
                 }
             }
