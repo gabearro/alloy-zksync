@@ -3,7 +3,7 @@
 use alloy::consensus::{
     SignableTransaction, Signed, Transaction, Typed2718, transaction::RlpEcdsaEncodableTx,
 };
-use alloy::primitives::Signature;
+use alloy::primitives::{Signature, U64};
 use alloy::primitives::{Address, Bytes, ChainId, TxKind, U256, keccak256};
 use alloy::rlp::{BufMut, Decodable, Encodable, Header};
 use alloy::rpc::types::TransactionInput;
@@ -83,6 +83,9 @@ pub struct TxEip712 {
     /// data: An unlimited size byte array specifying the
     /// input data of the message call, formally Td.
     pub input: Bytes,
+    /// The parity (0 for even, 1 for odd) of the y-value of the secp256k1 signature
+    #[serde(rename = "yParity", default, skip_serializing_if = "Option::is_none")]
+    pub y_parity: Option<U64>,
     /// ZKsync-specific fields.
     #[serde(flatten)]
     pub eip712_meta: Option<Eip712Meta>,
@@ -171,6 +174,8 @@ impl TxEip712 {
             from,
             value,
             input,
+            // populate yParity from the decoded signature's v field (0/1)
+            y_parity: Some(U64::from(signature.v() as u64)),
             eip712_meta: Some(eip712_meta),
         };
 
@@ -449,7 +454,7 @@ mod tests {
     use super::TxEip712;
     use alloy::consensus::SignableTransaction;
     use alloy::hex::FromHex;
-    use alloy::primitives::{Address, B256, Bytes, FixedBytes, Signature, U256, address, hex};
+    use alloy::primitives::{Address, B256, Bytes, FixedBytes, Signature, U256, U64, address, hex};
 
     #[test]
     fn decode_eip712_tx() {
@@ -540,6 +545,7 @@ mod tests {
             max_fee_per_gas: 11,
             max_priority_fee_per_gas: 0,
             input: vec![0x01, 0x02, 0x03].into(),
+            y_parity: Some(U64::from(1)),
             eip712_meta: Some(eip712_meta),
         };
         let expected_signature_hash = FixedBytes::<32>::from_str(
@@ -586,6 +592,7 @@ mod tests {
             max_fee_per_gas: 11,
             max_priority_fee_per_gas: 0,
             input: vec![0x01, 0x02, 0x03].into(),
+            y_parity: Some(U64::from(1)),
             eip712_meta: Some(eip712_meta),
         };
 

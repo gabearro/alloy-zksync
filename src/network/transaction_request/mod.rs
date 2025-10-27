@@ -2,7 +2,7 @@ use alloy::network::{
     Network, TransactionBuilder, TransactionBuilderError, UnbuiltTransactionError,
 };
 use alloy::primitives::{B256, Bytes, TxKind, U256};
-
+use k256::elliptic_curve::consts::U25;
 use crate::contracts::l2::contract_deployer::CONTRACT_DEPLOYER_ADDRESS;
 use crate::network::{tx_type::TxType, unsigned_tx::eip712::TxEip712};
 
@@ -457,6 +457,7 @@ impl TransactionBuilder<Zksync> for TransactionRequest {
             let tx = TxEip712 {
                 chain_id: self.base.chain_id.unwrap(),
                 nonce: U256::from(self.base.nonce.unwrap()), // TODO: Deployment nonce?
+                y_parity: None,
                 gas: self.base.gas.unwrap(),
                 max_fee_per_gas: self.base.max_fee_per_gas.unwrap(),
                 max_priority_fee_per_gas: self.base.max_priority_fee_per_gas.unwrap(),

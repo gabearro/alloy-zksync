@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-
 /// ZKsync transaction response.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(
@@ -129,8 +128,8 @@ mod serde_from {
     use crate::network::transaction_response::TransactionResponse;
     use crate::network::tx_envelope::TxEnvelope;
     use crate::network::unsigned_tx::eip712::TxEip712;
-    use alloy::consensus::{Signed, transaction::Recovered};
-    use alloy::primitives::{BlockHash, Signature, U256};
+    use alloy::consensus::{transaction::Recovered, Signed};
+    use alloy::primitives::{BlockHash, U256};
     use serde::{Deserialize, Serialize};
 
     /// Exactly the same thing as [`alloy::rpc::types::transaction::Transaction`] but without the
@@ -168,6 +167,14 @@ mod serde_from {
         pub effective_gas_price: Option<String>,
     }
 
+    /// Raw transaction JSON that we'll attempt to deserialize as a standard Ethereum transaction
+    /// before trying ZKsync-specific formats.
+    #[derive(Serialize, Deserialize)]
+    pub struct RawTransaction {
+        #[serde(flatten)]
+        pub fields: serde_json::Map<String, serde_json::Value>,
+    }
+
     /// (De)serializes both regular [`alloy::rpc::types::transaction::Transaction`] and [`TransactionWithoutFrom`].
     #[derive(Serialize, Deserialize)]
     #[serde(untagged)]
@@ -177,6 +184,8 @@ mod serde_from {
         // Some zkSync nodes omit signature fields in full tx objects for type 0x71.
         // Accept an unsigned EIP-712 tx and synthesize a zero signature.
         WithoutFromUnsigned(TransactionWithoutFromUnsigned),
+        // Fallback for standard Ethereum transactions that don't fit the custom envelope
+        Raw(RawTransaction),
     }
 
     impl From<TransactionEither> for TransactionResponse {
@@ -225,6 +234,59 @@ mod serde_from {
                             transaction_index: parse_u64_opt_hex(&value.transaction_index),
                             effective_gas_price: parse_u128_opt_hex(&value.effective_gas_price),
                         },
+                    }
+                }
+                TransactionEither::Raw(raw) => {
+                    // Try to deserialize as a standard alloy transaction with native envelope
+                    let mut json_value = serde_json::Value::Object(raw.fields);
+
+                    // Add default values for fields that might be missing
+                    if let Some(obj) = json_value.as_object_mut() {
+                        // Add empty accessList if missing (required for type 0x2/0x1 transactions)
+                        if !obj.contains_key("accessList") {
+                            obj.insert("accessList".to_string(), serde_json::json!([]));
+                        }
+
+                        // Add default blobVersionedHashes if missing (for type 0x3 transactions)
+                        if !obj.contains_key("blobVersionedHashes") && obj.get("type").and_then(|t| t.as_str()) == Some("0x3") {
+                            obj.insert("blobVersionedHashes".to_string(), serde_json::json!([]));
+                        }
+                    }
+
+                    match serde_json::from_value::<
+                    alloy::rpc::types::transaction::Transaction<
+                    alloy::consensus::TxEnvelope
+                        >
+                        >(json_value.clone()) {
+                        Ok(native_tx) => {
+                            // Extract the inner envelope and from address
+                            let envelope = native_tx.inner.clone().into_inner();
+                            let from = alloy::network::TransactionResponse::from(&native_tx);
+
+                            // Wrap the native transaction in our custom envelope
+                            TransactionResponse {
+                                inner: alloy::rpc::types::transaction::Transaction {
+                                    inner: Recovered::new_unchecked(
+                                        TxEnvelope::Native(envelope),
+                                        from
+                                    ),
+                                    block_hash: native_tx.block_hash,
+                                    block_number: native_tx.block_number,
+                                    transaction_index: native_tx.transaction_index,
+                                    effective_gas_price: native_tx.effective_gas_price,
+                                },
+                            }
+                        }
+                        Err(e) => {
+                            // If we still can't deserialize, panic with a helpful error
+                            panic!(
+                                "Failed to deserialize transaction as any known format.\n\
+                 Original JSON: {}\n\
+                 Error: {}",
+                                serde_json::to_string_pretty(&json_value).unwrap_or_default(),
+                                e
+                            );
+                        }
                     }
                 }
             }
