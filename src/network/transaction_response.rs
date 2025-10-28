@@ -125,11 +125,11 @@ mod serde_from {
     //!
     //! This is needed because we might need to deserialize the `from` field into both
     //! [`field@alloy::rpc::types::transaction::Transaction::from`] and [`field@TxEip712::from`].
-    use crate::network::transaction_response::TransactionResponse;
+    use super::TransactionResponse;
     use crate::network::tx_envelope::TxEnvelope;
     use crate::network::unsigned_tx::eip712::TxEip712;
-    use alloy::consensus::{transaction::Recovered, Signed};
-    use alloy::primitives::{BlockHash, U256};
+    use alloy::consensus::{Signed, transaction::Recovered};
+    use alloy::primitives::{BlockHash, Signature, U256};
     use serde::{Deserialize, Serialize};
 
     /// Exactly the same thing as [`alloy::rpc::types::transaction::Transaction`] but without the
@@ -167,14 +167,6 @@ mod serde_from {
         pub effective_gas_price: Option<String>,
     }
 
-    /// Raw transaction JSON that we'll attempt to deserialize as a standard Ethereum transaction
-    /// before trying ZKsync-specific formats.
-    #[derive(Serialize, Deserialize)]
-    pub struct RawTransaction {
-        #[serde(flatten)]
-        pub fields: serde_json::Map<String, serde_json::Value>,
-    }
-
     /// (De)serializes both regular [`alloy::rpc::types::transaction::Transaction`] and [`TransactionWithoutFrom`].
     #[derive(Serialize, Deserialize)]
     #[serde(untagged)]
@@ -184,8 +176,88 @@ mod serde_from {
         // Some zkSync nodes omit signature fields in full tx objects for type 0x71.
         // Accept an unsigned EIP-712 tx and synthesize a zero signature.
         WithoutFromUnsigned(TransactionWithoutFromUnsigned),
-        // Fallback for standard Ethereum transactions that don't fit the custom envelope
-        Raw(RawTransaction),
+        // Standard Ethereum transactions (Legacy, EIP-2930, EIP-1559, EIP-4844)
+        // that might have missing optional fields
+        StandardEthereum(StandardEthereumTransaction),
+    }
+
+    /// A more lenient deserialization of standard Ethereum transactions that accepts
+    /// missing optional fields (like accessList, blobVersionedHashes, etc.)
+    #[derive(Serialize, Deserialize)]
+    pub struct StandardEthereumTransaction {
+        #[serde(flatten)]
+        pub inner: LenientTxEnvelope,
+        pub from: alloy::primitives::Address,
+        #[serde(default, rename = "blockHash")]
+        pub block_hash: Option<BlockHash>,
+        #[serde(default, rename = "blockNumber")]
+        pub block_number: Option<String>,
+        #[serde(default, rename = "transactionIndex")]
+        pub transaction_index: Option<String>,
+        #[serde(default, rename = "effectiveGasPrice")]
+        pub effective_gas_price: Option<String>,
+    }
+
+    /// A lenient version of transaction envelope that accepts missing optional fields
+    #[derive(Serialize, Deserialize)]
+    #[serde(untagged)]
+    pub enum LenientTxEnvelope {
+        /// Legacy transaction
+        Legacy(LenientSignedLegacyTx),
+        /// EIP-2930 transaction
+        Eip2930(LenientSignedEip2930Tx),
+        /// EIP-1559 transaction
+        Eip1559(LenientSignedEip1559Tx),
+        /// EIP-4844 transaction
+        Eip4844(LenientSignedEip4844Tx),
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub struct LenientSignedLegacyTx {
+        #[serde(flatten)]
+        pub tx: alloy::consensus::TxLegacy,
+        pub r: alloy::primitives::U256,
+        pub s: alloy::primitives::U256,
+        #[serde(default)]
+        pub v: alloy::primitives::U256,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub struct LenientSignedEip2930Tx {
+        #[serde(flatten)]
+        pub tx: alloy::consensus::TxEip2930,
+        pub r: alloy::primitives::U256,
+        pub s: alloy::primitives::U256,
+        #[serde(default, rename = "yParity")]
+        pub y_parity: Option<String>,
+        #[serde(default)]
+        pub v: Option<String>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub struct LenientSignedEip1559Tx {
+        #[serde(flatten)]
+        pub tx: alloy::consensus::TxEip1559,
+        pub r: alloy::primitives::U256,
+        pub s: alloy::primitives::U256,
+        #[serde(default, rename = "yParity")]
+        pub y_parity: Option<String>,
+        #[serde(default)]
+        pub v: Option<String>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub struct LenientSignedEip4844Tx {
+        #[serde(flatten)]
+        pub tx: alloy::consensus::TxEip4844,
+        #[serde(default, rename = "blobVersionedHashes")]
+        pub blob_versioned_hashes: Option<Vec<alloy::primitives::B256>>,
+        pub r: alloy::primitives::U256,
+        pub s: alloy::primitives::U256,
+        #[serde(default, rename = "yParity")]
+        pub y_parity: Option<String>,
+        #[serde(default)]
+        pub v: Option<String>,
     }
 
     impl From<TransactionEither> for TransactionResponse {
@@ -206,6 +278,23 @@ mod serde_from {
                     u128::from_str_radix(v, 16).ok()
                 })
             }
+
+            fn parse_parity(y_parity: &Option<String>, v: &Option<String>) -> bool {
+                // Try yParity first
+                if let Some(yp) = y_parity {
+                    let yp = yp.trim().strip_prefix("0x").unwrap_or(yp);
+                    return yp == "1" || yp == "01";
+                }
+                // Fall back to v
+                if let Some(v_str) = v {
+                    let v_str = v_str.trim().strip_prefix("0x").unwrap_or(v_str);
+                    if let Ok(v_val) = u64::from_str_radix(v_str, 16) {
+                        return v_val % 2 == 0;
+                    }
+                }
+                false
+            }
+
             match value {
                 TransactionEither::Regular(tx) => TransactionResponse { inner: tx },
                 TransactionEither::WithoutFrom(value) => {
@@ -221,7 +310,6 @@ mod serde_from {
                     }
                 }
                 TransactionEither::WithoutFromUnsigned(value) => {
-                    use alloy::primitives::Signature;
                     let from = value.inner.from;
                     // Synthesize a zero signature; hash will be computed lazily if needed.
                     let dummy_sig = Signature::new(U256::ZERO, U256::ZERO, false);
@@ -236,57 +324,41 @@ mod serde_from {
                         },
                     }
                 }
-                TransactionEither::Raw(raw) => {
-                    // Try to deserialize as a standard alloy transaction with native envelope
-                    let mut json_value = serde_json::Value::Object(raw.fields);
-
-                    // Add default values for fields that might be missing
-                    if let Some(obj) = json_value.as_object_mut() {
-                        // Add empty accessList if missing (required for type 0x2/0x1 transactions)
-                        if !obj.contains_key("accessList") {
-                            obj.insert("accessList".to_string(), serde_json::json!([]));
+                TransactionEither::StandardEthereum(value) => {
+                    let envelope = match value.inner {
+                        LenientTxEnvelope::Legacy(tx) => {
+                            let sig = Signature::from_scalars_and_parity(tx.r.into(), tx.s.into(), tx.v != U256::ZERO);
+                            let signed = Signed::new_unchecked(tx.tx, sig, Default::default());
+                            alloy::consensus::TxEnvelope::Legacy(signed)
                         }
-
-                        // Add default blobVersionedHashes if missing (for type 0x3 transactions)
-                        if !obj.contains_key("blobVersionedHashes") && obj.get("type").and_then(|t| t.as_str()) == Some("0x3") {
-                            obj.insert("blobVersionedHashes".to_string(), serde_json::json!([]));
+                        LenientTxEnvelope::Eip2930(tx) => {
+                            let parity = parse_parity(&tx.y_parity, &tx.v);
+                            let sig = Signature::from_scalars_and_parity(tx.r.into(), tx.s.into(), parity);
+                            let signed = Signed::new_unchecked(tx.tx, sig, Default::default());
+                            alloy::consensus::TxEnvelope::Eip2930(signed)
                         }
-                    }
-
-                    match serde_json::from_value::<
-                    alloy::rpc::types::transaction::Transaction<
-                    alloy::consensus::TxEnvelope
-                        >
-                        >(json_value.clone()) {
-                        Ok(native_tx) => {
-                            // Extract the inner envelope and from address
-                            let envelope = native_tx.inner.clone().into_inner();
-                            let from = alloy::network::TransactionResponse::from(&native_tx);
-
-                            // Wrap the native transaction in our custom envelope
-                            TransactionResponse {
-                                inner: alloy::rpc::types::transaction::Transaction {
-                                    inner: Recovered::new_unchecked(
-                                        TxEnvelope::Native(envelope),
-                                        from
-                                    ),
-                                    block_hash: native_tx.block_hash,
-                                    block_number: native_tx.block_number,
-                                    transaction_index: native_tx.transaction_index,
-                                    effective_gas_price: native_tx.effective_gas_price,
-                                },
-                            }
+                        LenientTxEnvelope::Eip1559(tx) => {
+                            let parity = parse_parity(&tx.y_parity, &tx.v);
+                            let sig = Signature::from_scalars_and_parity(tx.r.into(), tx.s.into(), parity);
+                            let signed = Signed::new_unchecked(tx.tx, sig, Default::default());
+                            alloy::consensus::TxEnvelope::Eip1559(signed)
                         }
-                        Err(e) => {
-                            // If we still can't deserialize, panic with a helpful error
-                            panic!(
-                                "Failed to deserialize transaction as any known format.\n\
-                 Original JSON: {}\n\
-                 Error: {}",
-                                serde_json::to_string_pretty(&json_value).unwrap_or_default(),
-                                e
-                            );
+                        LenientTxEnvelope::Eip4844(tx) => {
+                            let parity = parse_parity(&tx.y_parity, &tx.v);
+                            let sig = Signature::from_scalars_and_parity(tx.r.into(), tx.s.into(), parity);
+                            let signed = Signed::new_unchecked(tx.tx, sig, Default::default());
+                            alloy::consensus::TxEnvelope::Eip4844(signed.into())
                         }
+                    };
+
+                    TransactionResponse {
+                        inner: alloy::rpc::types::transaction::Transaction {
+                            inner: Recovered::new_unchecked(TxEnvelope::Native(envelope), value.from),
+                            block_hash: value.block_hash,
+                            block_number: parse_u64_opt_hex(&value.block_number),
+                            transaction_index: parse_u64_opt_hex(&value.transaction_index),
+                            effective_gas_price: parse_u128_opt_hex(&value.effective_gas_price),
+                        },
                     }
                 }
             }
